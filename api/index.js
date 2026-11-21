@@ -27,21 +27,15 @@ app.get("/ping", (_req, res) => res.send("pong"));
 
 app.post("/api/claim-pair", async (req, res) => {
   try {
-    const pairId = genPairId();
-    await redis.set(`pair:${pairId}`, { id: pairId, createdAt: Date.now() });
-    res.json({ valid: true, pairId });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get("/rat/pairid", async (req, res) => {
-  try {
-    const keys = await redis.keys("pair:*");
-    if (keys.length > 0) {
-      const pairId = keys[0].replace("pair:", "");
-      return res.json({ valid: true, pairId });
+    const { existingPairId } = req.body;
+    
+    if (existingPairId) {
+      const valid = await redis.get(`pair:${existingPairId.toUpperCase()}`);
+      if (valid) {
+        return res.json({ valid: true, pairId: existingPairId.toUpperCase() });
+      }
     }
+
     const pairId = genPairId();
     await redis.set(`pair:${pairId}`, { id: pairId, createdAt: Date.now() });
     res.json({ valid: true, pairId });
@@ -87,7 +81,7 @@ app.get("/rat/my-devices", async (req, res) => {
       const t = await redis.get(k);
       if (!t) continue;
 
-      if (t.pairId !== key) continue;
+      if (t.pairId !== key.toUpperCase()) continue;
 
       const seen = Date.parse(t.lastSeen || 0) || 0;
       const on = now - seen < 30000;
@@ -103,7 +97,7 @@ app.get("/rat/my-devices", async (req, res) => {
 
     res.json({
       valid: true,
-      pairId: key,
+      pairId: key.toUpperCase(),
       devices,
       myDevicesCount: devices.length,
       totalDevices: devices.length,
@@ -238,4 +232,4 @@ if (require.main === module) {
   app.listen(PORT, "0.0.0.0", () =>
     console.log(`Voidhand API listening on :${PORT}`)
   );
-}
+  }
